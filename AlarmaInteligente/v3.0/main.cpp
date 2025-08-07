@@ -21,9 +21,9 @@
 #define PIR_PIN       27
 #define LDR_PIN       34
 #define POT_PIN       35
-#define SILENCE_BUTTON_PIN 22
-#define ARM_BUTTON_PIN   4
-#define ARM_LED_PIN      13
+#define RESET_BUTTON_PIN 22 // Botón para resetear la alarma
+#define ARM_BUTTON_PIN   4  // Botón para armar/desarmar el sistema
+#define ARM_LED_PIN      13 // LED que indica si el sistema está armado
 #define SD_CS_PIN     5
 #define AUDIO_OUT_PIN 25
 
@@ -37,13 +37,12 @@ AudioOutputI2S *out;
 // --- Variables Globales ---
 bool sistemaArmado = true;
 bool alarmaActivada = false;
-bool sonidoSilenciado = false;
 unsigned long tiempoAnterior = 0;
 bool notificacionEnviada = false;
 int ultimoEstadoBotonArmado = HIGH;
 unsigned long tiempoUltimoRebote = 0;
 
-// (Todas las funciones de ayuda no cambian)
+// (Función enviarMensajeDiscord no cambia)
 void enviarMensajeDiscord(String titulo, String detalle) {
   if (WiFi.status() == WL_CONNECTED) {
     struct tm timeinfo;
@@ -74,6 +73,7 @@ void enviarMensajeDiscord(String titulo, String detalle) {
   }
 }
 
+// ---> CAMBIO: on_message ahora solo maneja el reset remoto
 void on_message(char* topic, byte* payload, unsigned int length) {
   char json[length + 1];
   strncpy(json, (char*)payload, length);
@@ -83,9 +83,12 @@ void on_message(char* topic, byte* payload, unsigned int length) {
   const char* methodName = doc["method"];
   if (methodName != NULL && strcmp(methodName, "setValue") == 0) {
     if (alarmaActivada) {
-        enviarMensajeDiscord("ALARMA SILENCIADA", "Silenciamiento remoto desde el panel.");
+        enviarMensajeDiscord("ALARMA RESETEADA", "Alarma reseteada remotamente desde el panel.");
     }
-    sonidoSilenciado = true;
+    alarmaActivada = false;
+    if (mp3 && mp3->isRunning()) mp3->stop();
+    notificacionEnviada = false;
+    
     String topicStr = String(topic);
     String requestId = topicStr.substring(topicStr.lastIndexOf('/') + 1);
     String responseTopic = "v1/devices/me/rpc/response/" + requestId;
@@ -97,7 +100,7 @@ void setup() {
   Serial.begin(115200);
   
   pinMode(PIR_PIN, INPUT);
-  pinMode(SILENCE_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
   pinMode(ARM_BUTTON_PIN, INPUT_PULLUP);
   pinMode(ARM_LED_PIN, OUTPUT);
   
@@ -109,7 +112,7 @@ void setup() {
   out = new AudioOutputI2S(0, AudioOutputI2S::INTERNAL_DAC);
   out->SetPinout(26, 25, -1);
   out->SetOutputModeMono(true);
-  out->SetGain(0.8);
+  out->SetGain(0.8);  //volumen
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) {
@@ -146,7 +149,6 @@ void loop() {
     sistemaArmado = !sistemaArmado;
     if (!sistemaArmado) {
       alarmaActivada = false;
-      sonidoSilenciado = false;
       if (mp3 && mp3->isRunning()) mp3->stop();
     }
     enviarMensajeDiscord(sistemaArmado ? "SISTEMA ARMADO" : "SISTEMA DESARMADO", "El estado del sistema ha cambiado.");
@@ -158,18 +160,19 @@ void loop() {
   if (sistemaArmado) {
     bool hayMovimiento = digitalRead(PIR_PIN);
     int nivelLuz = analogRead(LDR_PIN);
-    int umbralLuz = analogRead(POT_PIN);
+    int umbralLuz = analogRead(POT_PIN); // <-- Usa siempre el potenciómetro físico
     bool estaOscuro = nivelLuz > umbralLuz;
-    bool botonSilencioPresionado = (digitalRead(SILENCE_BUTTON_PIN) == LOW);
+    bool botonResetPresionado = (digitalRead(RESET_BUTTON_PIN) == LOW);
 
-    if (botonSilencioPresionado && alarmaActivada) {
-      sonidoSilenciado = true;
-      enviarMensajeDiscord("ALARMA SILENCIADA", "El sonido ha sido silenciado con el botón físico.");
+    if (botonResetPresionado && alarmaActivada) {
+      alarmaActivada = false;
+      if (mp3 && mp3->isRunning()) mp3->stop();
+      notificacionEnviada = false;
+      enviarMensajeDiscord("ALARMA RESETEADA", "La alarma ha sido reseteada con el botón físico.");
     }
      
     if (!alarmaActivada && hayMovimiento && estaOscuro) {
       alarmaActivada = true;
-      sonidoSilenciado = false;
       if (!notificacionEnviada) {
           String detalle = "Nivel de Luz: " + String(nivelLuz) + ", Umbral: " + String(umbralLuz);
           enviarMensajeDiscord("🚨 ALERTA DE MOVIMIENTO 🚨", detalle);
@@ -180,7 +183,7 @@ void loop() {
     alarmaActivada = false;
   }
 
-  if (alarmaActivada && !sonidoSilenciado) {
+  if (alarmaActivada) {
     if (mp3 == NULL || !mp3->isRunning()) {
       file = new AudioFileSourceSD("/alerta.mp3");
       mp3 = new AudioGeneratorMP3();
@@ -205,11 +208,12 @@ void loop() {
   if (millis() - tiempoAnterior > 1000) {
     tiempoAnterior = millis();
     
-    // --- MONITOR SERIE COMPLETO RESTAURADO ---
+    int umbralActual = analogRead(POT_PIN);
+
     Serial.print("Armado?: "); Serial.print(sistemaArmado);
     Serial.print(" | Movimiento: "); Serial.print(digitalRead(PIR_PIN));
     Serial.print(" | Luz: "); Serial.print(analogRead(LDR_PIN));
-    Serial.print(" | Umbral: "); Serial.print(analogRead(POT_PIN)); // <-- UMBRAL RESTAURADO
+    Serial.print(" | Umbral: "); Serial.print(umbralActual);
     Serial.print(" | Alarma ON?: "); Serial.println(alarmaActivada);
     
     StaticJsonDocument<200> jsonBuffer;
@@ -217,7 +221,7 @@ void loop() {
     telemetry["sistema_armado"] = sistemaArmado;
     telemetry["movimiento"] = digitalRead(PIR_PIN);
     telemetry["luz"] = analogRead(LDR_PIN);
-    telemetry["umbral"] = analogRead(POT_PIN);
+    telemetry["umbral"] = umbralActual;
     telemetry["alarma_activa"] = alarmaActivada;
     char payload[200];
     serializeJson(telemetry, payload);
