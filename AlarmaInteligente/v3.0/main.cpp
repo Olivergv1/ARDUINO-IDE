@@ -8,24 +8,32 @@
 #include "AudioGeneratorMP3.h"
 #include "AudioOutputI2S.h"
 #include "SD.h"
+#include <Wire.h>               // ---> CAMBIO OLED
+#include <Adafruit_GFX.h>       // ---> CAMBIO OLED
+#include <Adafruit_SSD1306.h>   // ---> CAMBIO OLED
 
 // --- CONFIGURACIÓN ---
-#define WIFI_SSID ""
-#define WIFI_PASSWORD ""
+#define WIFI_SSID "iPhone"
+#define WIFI_PASSWORD "12345678910a"
 #define THINGSBOARD_SERVER "thingsboard.cloud"
-#define THINGSBOARD_TOKEN ""
-#define DISCORD_WEBHOOK_URL ""
-#define DISCORD_USER_ID ""
+#define THINGSBOARD_TOKEN "wxlWntfhJQMv5RcUFrjW"
+#define DISCORD_WEBHOOK_URL "https://discord.com/api/webhooks/1401429369544511629/cZw1Q9hq7y-ihZLco7_lVwQTT8pIsK5pMefw1UnnYmvsOl68yKoC92SbQtYraB4XmS99"
+#define DISCORD_USER_ID "861304303922839563"
 
-// --- Pines del Proyecto ---
+// --- Pines del Proyecto (ACTUALIZADOS) ---
 #define PIR_PIN       27
 #define LDR_PIN       34
 #define POT_PIN       35
-#define RESET_BUTTON_PIN 22 // Botón para resetear la alarma
-#define ARM_BUTTON_PIN   4  // Botón para armar/desarmar el sistema
-#define ARM_LED_PIN      13 // LED que indica si el sistema está armado
+#define RESET_BUTTON_PIN 15 // <-- PIN MOVIDO
+#define ARM_BUTTON_PIN   4
+#define ARM_LED_PIN      13
 #define SD_CS_PIN     5
 #define AUDIO_OUT_PIN 25
+
+// ---> CAMBIO OLED: Configuración de la Pantalla
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 // --- Clientes ---
 WiFiClient espClient;
@@ -37,12 +45,14 @@ AudioOutputI2S *out;
 // --- Variables Globales ---
 bool sistemaArmado = true;
 bool alarmaActivada = false;
+bool sonidoSilenciado = false;
 unsigned long tiempoAnterior = 0;
 bool notificacionEnviada = false;
 int ultimoEstadoBotonArmado = HIGH;
 unsigned long tiempoUltimoRebote = 0;
+bool modoOnline = false;
 
-// (Función enviarMensajeDiscord no cambia)
+// (El resto del código no cambia)
 void enviarMensajeDiscord(String titulo, String detalle) {
   if (WiFi.status() == WL_CONNECTED) {
     struct tm timeinfo;
@@ -73,7 +83,6 @@ void enviarMensajeDiscord(String titulo, String detalle) {
   }
 }
 
-// ---> CAMBIO: on_message ahora solo maneja el reset remoto
 void on_message(char* topic, byte* payload, unsigned int length) {
   char json[length + 1];
   strncpy(json, (char*)payload, length);
@@ -109,22 +118,41 @@ void setup() {
     while(1);
   }
 
+  // ---> CAMBIO OLED: Iniciar pantalla
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    Serial.println(F("Fallo al iniciar la pantalla SSD1306"));
+    for(;;);
+  }
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println("Iniciando... (gay si lo lees ❤)");
+  display.display();
+  delay(1000);
+
   out = new AudioOutputI2S(0, AudioOutputI2S::INTERNAL_DAC);
   out->SetPinout(26, 25, -1);
   out->SetOutputModeMono(true);
-  out->SetGain(0.8);  //volumen
+  out->SetGain(0.9);
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
+  int intentos = 40;
+  while (WiFi.status() != WL_CONNECTED && intentos > 0) {
     delay(500);
-    Serial.print(".");
+    intentos--;
   }
-  Serial.println("\nWiFi conectado!");
-  Serial.println(WiFi.localIP());
 
-  configTime(-18000, 0, "pool.ntp.org");
-  client.setServer(THINGSBOARD_SERVER, 1883);
-  client.setCallback(on_message);
+  if (WiFi.status() == WL_CONNECTED) {
+    modoOnline = true;
+    configTime(-18000, 0, "pool.ntp.org");
+    client.setServer(THINGSBOARD_SERVER, 1883);
+    client.setCallback(on_message);
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(true);
+  } else {
+    modoOnline = false;
+  }
   
   Serial.println("Sistema de Alarma - LISTO");
 }
@@ -140,9 +168,16 @@ void reconnect() {
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) { delay(500); return; }
-  if (!client.connected()) { reconnect(); }
-  client.loop(); 
+  if (modoOnline) {
+    if (WiFi.status() != WL_CONNECTED) {
+      // El sistema de autoreconexión se encargará.
+    } else {
+      if (!client.connected()) {
+        reconnect();
+      }
+      client.loop(); 
+    }
+  }
 
   int estadoBotonArmado = digitalRead(ARM_BUTTON_PIN);
   if (estadoBotonArmado == LOW && ultimoEstadoBotonArmado == HIGH && millis() - tiempoUltimoRebote > 50) {
@@ -151,16 +186,17 @@ void loop() {
       alarmaActivada = false;
       if (mp3 && mp3->isRunning()) mp3->stop();
     }
-    enviarMensajeDiscord(sistemaArmado ? "SISTEMA ARMADO" : "SISTEMA DESARMADO", "El estado del sistema ha cambiado.");
+    if (modoOnline) enviarMensajeDiscord(sistemaArmado ? "SISTEMA ARMADO" : "SISTEMA DESARMADO", "El estado del sistema ha cambiado.");
     tiempoUltimoRebote = millis();
   }
   ultimoEstadoBotonArmado = estadoBotonArmado;
   digitalWrite(ARM_LED_PIN, sistemaArmado);
 
+  int nivelLuz = analogRead(LDR_PIN);
+  int umbralLuz = analogRead(POT_PIN);
+
   if (sistemaArmado) {
     bool hayMovimiento = digitalRead(PIR_PIN);
-    int nivelLuz = analogRead(LDR_PIN);
-    int umbralLuz = analogRead(POT_PIN); // <-- Usa siempre el potenciómetro físico
     bool estaOscuro = nivelLuz > umbralLuz;
     bool botonResetPresionado = (digitalRead(RESET_BUTTON_PIN) == LOW);
 
@@ -168,12 +204,12 @@ void loop() {
       alarmaActivada = false;
       if (mp3 && mp3->isRunning()) mp3->stop();
       notificacionEnviada = false;
-      enviarMensajeDiscord("ALARMA RESETEADA", "La alarma ha sido reseteada con el botón físico.");
+      if (modoOnline) enviarMensajeDiscord("ALARMA RESETEADA", "La alarma ha sido reseteada con el botón físico.");
     }
      
     if (!alarmaActivada && hayMovimiento && estaOscuro) {
       alarmaActivada = true;
-      if (!notificacionEnviada) {
+      if (!notificacionEnviada && modoOnline) {
           String detalle = "Nivel de Luz: " + String(nivelLuz) + ", Umbral: " + String(umbralLuz);
           enviarMensajeDiscord("🚨 ALERTA DE MOVIMIENTO 🚨", detalle);
           notificacionEnviada = true;
@@ -208,23 +244,28 @@ void loop() {
   if (millis() - tiempoAnterior > 1000) {
     tiempoAnterior = millis();
     
-    int umbralActual = analogRead(POT_PIN);
-
-    Serial.print("Armado?: "); Serial.print(sistemaArmado);
-    Serial.print(" | Movimiento: "); Serial.print(digitalRead(PIR_PIN));
-    Serial.print(" | Luz: "); Serial.print(analogRead(LDR_PIN));
-    Serial.print(" | Umbral: "); Serial.print(umbralActual);
-    Serial.print(" | Alarma ON?: "); Serial.println(alarmaActivada);
+    // ---> CAMBIO OLED: Actualizar la pantalla
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    display.print("L ");
+    display.print(nivelLuz);
+    display.setCursor(0, 32);
+    display.print("U ");
+    display.print(umbralLuz);
+    display.display();
     
-    StaticJsonDocument<200> jsonBuffer;
-    JsonObject telemetry = jsonBuffer.to<JsonObject>();
-    telemetry["sistema_armado"] = sistemaArmado;
-    telemetry["movimiento"] = digitalRead(PIR_PIN);
-    telemetry["luz"] = analogRead(LDR_PIN);
-    telemetry["umbral"] = umbralActual;
-    telemetry["alarma_activa"] = alarmaActivada;
-    char payload[200];
-    serializeJson(telemetry, payload);
-    client.publish("v1/devices/me/telemetry", payload);
+    if (modoOnline) {
+      StaticJsonDocument<200> jsonBuffer;
+      JsonObject telemetry = jsonBuffer.to<JsonObject>();
+      telemetry["sistema_armado"] = sistemaArmado;
+      telemetry["movimiento"] = digitalRead(PIR_PIN);
+      telemetry["luz"] = nivelLuz;
+      telemetry["umbral"] = umbralLuz;
+      telemetry["alarma_activa"] = alarmaActivada;
+      char payload[200];
+      serializeJson(telemetry, payload);
+      client.publish("v1/devices/me/telemetry", payload);
+    }
   }
 }
